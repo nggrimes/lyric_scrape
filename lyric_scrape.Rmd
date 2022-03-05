@@ -1,0 +1,211 @@
+---
+title: "Lyrical Lies"
+author: "Nathan Grimes"
+date: "3/3/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,warning = FALSE,results = FALSE,message = FALSE)
+```
+
+```{r}
+library(geniusr)
+library(tidyverse)
+library(tidytext)
+library(rvest)
+library(purrr)
+library(ggwordcloud)
+
+load("lyrics_df.Rdata")
+```
+
+# Step 1
+
+Create (or import if you have a running spreadsheet or something) the names of the bands you want to get all the possible lyrics for. Add a genre label either from an official site or give it yourself. If you choose to not add genre, then you must change the purrr mapping from map2(.x,.y) to map(.x).
+
+```{r}
+art_list<-c("Julien Baker","Rainbow Kitten Surprise")
+gen_list<-c("Indie","Indie")
+```
+
+# Purr through the artists
+
+I prefer to use the purrr package in this case for multiple reasons. 1) It allows us to search for any number of artists at one go. So if we make a big list the function will run on its own.  2) It's faster and more stable than using for loops. The stability comes from the use of the safely() function. If our function returns internal errors, which it probably will, safely() will continue to evaluate the function and keep track of errors for us to check later at the end of the run.  It does this by storing any values in a separate list and giving a NULL value for the function evaluation.  3) ESM 244 students need more purrr practice.
+
+First, we're going to use the Genius API to get all the song and album data for our chosen artists. These functions are simplified through the geniusr package so make sure you have that installed. Additionally you will need what's called an access token to use the API. Go to [the genius website to sign up for a free token]() . Use your personal website url as the site url. Every new session we will need to tell R what our access token is so you should easily store it in your own document by copying and pasting the token. I don't want everyone using mine so it's hidden here. 
+
+After we have a list of all the songs, we'll try to clean some of the names for redundancies like (remix) or (live). 
+
+```{r}
+# Define a function to use purrr
+check_art<-function(artist,genre,lyrics_df){
+  
+  # Check to make sure we don't already have the data for this artist, if we do create an error that we will keep track off
+  
+  if(artist %in% unique(lyrics_df$artist)){ stop(paste(artist,"already in lyric database. If updating change update=1",sep=" "))}
+  
+  # This is where the Genius API works it magic
+  art<-search_artist(artist)
+  
+  if(art$artist_name[1]!=artist){
+    
+  stop(paste("Check spelling or Genius doesn't have data on",artist,sep=" "))}
+
+  songs<-get_artist_songs_df(art$artist_id[1])  #Get the first/ most popular artist of that name (avoid other collaborations)
+
+  
+  #clean and arrange the song list
+  inter_art_song<-songs %>% 
+    select(song_id,song_name,artist_name) %>% 
+    mutate(genre=genre)
+  
+  return(inter_art_song)
+}
+```
+
+
+```{r}
+# Now run the purrr, but first define our function to do so safely
+safe_art<-safely(check_art,otherwise = NULL)
+
+art_check<-map2(art_list,gen_list,~safe_art(.x,.y,lyrics_df)) %>% transpose()
+
+#store the errors of the run if you want to see what artist or song didn't make it through
+any_errors<-compact(art_check$error)
+
+
+# unpack the lists into usable tibbles
+song_df<-compact(art_check$result)  %>% 
+  as_tibble_col(column_name = "songs") %>% 
+  unnest()
+```
+
+## Scrape the lyrics
+
+Great! Now we have all the possible songs. We're going to use songlyrics.com because they have an easy to piece together url to scrape the data from. In class I can go over in more detail what exactly I'm doing. For your use, just take the song_df we made in the last section and use the song_id column to pass into the first argument. Don't worry about connection warning messages. I'm trying to find ways to surpress those issues.
+
+```{r}
+### Now take the song list from genius and scrape the lyrics from songlyrics.com
+
+get_lyrics<-function(song_id,genre){
+  
+  
+  #Use genius to get name and identifier
+  app<-get_song(song_id = song_id)
+    
+ #Create url base
+  base1<-c("https://songlyrics.com/")
+
+  base2<-c("-lyrics")
+
+#Clean the artist name and song name to match the url
+  artist_url<-str_replace_all(app$content$artist_names,pattern = "(?!\\!)[[:punct:]]",replacement = " ") %>% 
+    str_replace_all(pattern = " ",replacement = "-") %>% 
+    str_to_lower() %>% 
+    str_squish() %>% 
+    str_replace_all(pattern="--","-")
+
+  song_url<- str_replace_all(app$content$title,pattern = "(?!\\!)[[:punct:]]",replacement = " ") %>% 
+    str_replace_all(pattern = " ",replacement = "-") %>% 
+    str_to_lower() %>% 
+    str_squish() %>% 
+    str_replace_all(pattern="--","-")
+
+
+  url<-paste(base1,artist_url,"/",song_url,base2,sep="")
+  
+  #Test to see if the website actually has the song data. Try catch lets me define errors
+  out<-tryCatch({
+    read_html(url)
+  },
+  
+  error=function(cond){
+
+    return(NA)
+  }
+  
+  )
+  
+
+ 
+  if(is.na(out)){
+    
+  stop(paste("Songlyrics.com doesn't have data on",app$content$artist_names,app$content$title,sep=" "))}  
+
+  
+  #Get the data from the website and clean it up
+
+  test<-read_html(url) %>% 
+    html_nodes("#songLyricsDiv") %>% 
+    html_text() %>% 
+    str_replace_all("\n"," ") %>% 
+    str_remove_all(pattern = "[[:punct:]]") %>% 
+    str_to_lower() %>% 
+    str_split(" ") %>% 
+    as.data.frame() %>% 
+    mutate(song=app$content$title,artist=app$content$artist_names,album=app$content$album$name) #Add other names
+  colnames(test)[1]<-"word"
+  
+  if(!"album" %in% colnames(test)){
+    test$album<-NA
+  }
+  
+  #add genre and remove stop words
+  test$genre<-genre
+  
+  test_clean<-test %>% 
+    anti_join(stop_words,by="word")
+  
+
+  
+  return(test_clean)
+}
+```
+
+
+```{r}
+### Run the map to get the song lyrics then clean up the dataframe
+safe_get_ly<-safely(get_lyrics)
+
+ 
+  song_lyrics<-map2(song_df$song_id,song_df$genre,~safe_get_ly(.x,.y)) %>% transpose()
+  
+  any_errors_lyrics<-compact(song_lyrics$error)
+  
+  
+#Extract the data from the lists  
+  lyrics<-compact(song_lyrics$result)  %>% 
+  as_tibble_col(column_name = "word") %>% 
+  unnest()
+
+
+  lyrics_df<-rbind(lyrics_df,lyrics)
+  
+  save(lyrics_df,file="lyrics_df.Rdata")
+  
+```
+
+## Data manipulation
+
+With the updated lyrics tab you can now do any data manipulation you see fit! Here's an example world cloud
+
+```{r}
+
+cloud_plot_df<-lyrics_df %>% 
+  filter(artist=="Rainbow Kitten Surprise") %>% 
+  count(word) %>% 
+  arrange(-n) %>% 
+  slice(1:100)
+
+cloud<-ggplot(data=cloud_plot_df,aes(label=word))+
+  geom_text_wordcloud(aes(color=n,size=n),shape="diamond")+
+  scale_size_area(max_size = 6)+
+  scale_color_gradientn(colors = c("darkgreen","blue","purple"))+
+  theme_minimal()
+
+
+
+cloud
+```
+
